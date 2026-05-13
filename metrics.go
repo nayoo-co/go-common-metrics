@@ -1,119 +1,152 @@
-// Package metrics — NaYoo shared Prometheus client wrapper.
+// Package metrics — NaYoo standard Prometheus client wrapper.
 //
-// Standard usage in a Gin service main.go:
+// One library, three entry points — pick the one that matches your service type:
 //
-//	import metrics "github.com/serpentdark/go-common-metrics"
+//	BFF        → metrics.InitBFF("go-process-nayoo-service")
+//	System     → metrics.InitSystem("go-system-listing-service")
+//	Worker     → metrics.InitWorker("go-realtime-search-sync")
 //
-//	func main() {
-//	    metrics.Init("go-system-listing-service")
-//	    go metrics.Serve(":9090")          // /metrics on a sidecar port
-//	    r := gin.Default()
-//	    r.Use(metrics.GinMiddleware())     // observe every HTTP request
-//	    // ... routes ...
-//	    r.Run(":" + os.Getenv("PORT"))
-//	}
+// After Init, expose /metrics + /healthz + /readyz on a sidecar port:
 //
-// Worker (no Gin):
+//	go func() { _ = metrics.Serve(":9090") }()
 //
-//	metrics.Init("go-worker-listing-service")
-//	go metrics.Serve(":9090")
-//	// ... worker loop ...
+// Instrumentation helpers — wrap each external call with the matching helper.
+// All helpers record into shared metrics with consistent labels so the
+// service map / dashboards / alerts work uniformly across all 14 services.
+//
+//	metrics.GinMiddleware()                                   // HTTP server
+//	metrics.ObserveDownstream("auth-svc", fn)                 // service→service HTTP
+//	metrics.ObserveDB("posts", "find_one", fn)                // service→DocDB
+//	metrics.ObserveCache("listing", fn)                       // service→Redis/Valkey
+//	metrics.ObserveExternal("s3", "put_object", fn)           // service→AWS / 3rd-party
+//	metrics.ObserveJob("rank-update", fn)                     // worker job
+//	metrics.RecordSync("posts", "meilisearch", "insert", n)   // CDC row count
+//	metrics.SetSyncLag("posts", lagSec)                       // CDC lag
+//	metrics.SetSyncProgress("posts", "initial_scan", 0.42)    // initial sync %
+//	metrics.SetQueueDepth("approval", n)                      // backlog gauge
+//
+// Service-specific custom metrics still register on the exported Registry:
+//
+//	myBusinessCounter := prometheus.NewCounter(...)
+//	metrics.Registry.MustRegister(myBusinessCounter)
 package metrics
 
 import (
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-var (
-	// Registry is the package-level registry. Init() populates it with
-	// default collectors (Go runtime + process) and the NaYoo HTTP counters.
-	// Exposed so services can register their own custom business metrics:
-	//   metrics.Registry.MustRegister(myBusinessCounter)
-	Registry = prometheus.NewRegistry()
+// ServiceType — one of "bff", "system", "worker". Set by InitBFF/System/Worker
+// and stamped as a const label on every standard metric so dashboards can
+// filter by tier without per-service config.
+type ServiceType string
 
-	// HTTPRequests counts every HTTP request handled, labeled by method,
-	// route template (NOT raw URL — avoids cardinality blow-up), and status code.
-	HTTPRequests *prometheus.CounterVec
-
-	// HTTPDuration is a histogram of request handling latency in seconds.
-	// Buckets cover < 1ms up to > 10s to fit typical web latencies.
-	HTTPDuration *prometheus.HistogramVec
-
-	// HTTPInflight tracks concurrent in-progress requests.
-	HTTPInflight *prometheus.GaugeVec
-
-	serviceName string
-	initOnce    sync.Once
+const (
+	TypeBFF    ServiceType = "bff"
+	TypeSystem ServiceType = "system"
+	TypeWorker ServiceType = "worker"
 )
 
-// Init must be called once at service start. It seeds the registry with:
-//   - Go runtime collector (goroutines, GC, memstats)
-//   - Process collector (RSS, CPU seconds, open FDs)
-//   - NaYoo HTTP counters/histograms (no samples until middleware fires)
-//
-// The serviceName argument becomes the `service` label on every NaYoo
-// metric — keep it stable across deployments of the same service.
-func Init(name string) {
+// Registry is the package-level Prometheus registry. Init* seeds it with
+// default collectors (Go runtime + process) and the standard metric set
+// appropriate for the chosen ServiceType. Services that need custom
+// business metrics register them on this Registry too.
+var Registry = prometheus.NewRegistry()
+
+var (
+	serviceName string
+	serviceType ServiceType
+	initOnce    sync.Once
+	startTime   = time.Now()
+)
+
+// InitBFF prepares the registry for a BFF (Gin HTTP server + outbound HTTP
+// to downstream services). Call once at service start, before any helper
+// or middleware is used.
+func InitBFF(name string) { initWith(name, TypeBFF) }
+
+// InitSystem prepares the registry for a system service (Gin HTTP server +
+// DocDB + Redis + external APIs).
+func InitSystem(name string) { initWith(name, TypeSystem) }
+
+// InitWorker prepares the registry for a worker / job runner (no HTTP server
+// by default — register jobs via ObserveJob/RecordSync/etc.).
+func InitWorker(name string) { initWith(name, TypeWorker) }
+
+func initWith(name string, kind ServiceType) {
 	initOnce.Do(func() {
 		serviceName = name
+		serviceType = kind
+		startTime = time.Now()
 
+		// Built-in collectors — Go runtime (goroutines, GC, memstats) +
+		// process (RSS, CPU seconds, open FDs).
 		Registry.MustRegister(collectors.NewGoCollector())
 		Registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
-		HTTPRequests = prometheus.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: "nayoo_http_requests_total",
-				Help: "Total HTTP requests handled, labeled by method, route template, and status code.",
-			},
-			[]string{"service", "method", "path", "code"},
-		)
-		HTTPDuration = prometheus.NewHistogramVec(
-			prometheus.HistogramOpts{
-				Name: "nayoo_http_request_duration_seconds",
-				Help: "HTTP request handling latency.",
-				Buckets: []float64{
-					0.001, 0.005, 0.01, 0.025, 0.05, 0.1,
-					0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-				},
-			},
-			[]string{"service", "method", "path"},
-		)
-		HTTPInflight = prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Name: "nayoo_http_inflight_requests",
-				Help: "In-progress HTTP requests being handled right now.",
-			},
-			[]string{"service"},
-		)
-
-		Registry.MustRegister(HTTPRequests, HTTPDuration, HTTPInflight)
+		registerHTTPServerMetrics()
+		registerHTTPClientMetrics()
+		registerDBMetrics()
+		registerCacheMetrics()
+		registerExternalMetrics()
+		registerJobMetrics()
+		registerSyncMetrics()
+		registerQueueMetrics()
+		registerHealthMetrics()
+		registerBuildInfoMetrics()
 	})
 }
 
-// ServiceName returns the name passed to Init() — useful for services that
-// want to tag their own custom metrics with the same service label.
+// ServiceName returns the name passed to Init*.
 func ServiceName() string { return serviceName }
 
-// Serve starts a dedicated HTTP server that exposes Prometheus metrics on
-// `/metrics` at the given address. It's a blocking call — run in a goroutine.
-// Intended for a sidecar-style port (e.g., :9090) separate from the main
-// application port so the metrics endpoint isn't subject to auth/middleware
-// configured on the Gin engine.
+// Type returns the service type set by Init*.
+func Type() ServiceType { return serviceType }
+
+// constLabels returns the labels stamped on every standard metric.
+// Service-specific custom metrics should also add these where useful.
+func constLabels() prometheus.Labels {
+	return prometheus.Labels{
+		"service":      serviceName,
+		"service_type": string(serviceType),
+	}
+}
+
+// Serve starts an HTTP server on addr exposing:
+//
+//	/metrics — Prometheus scrape target
+//	/healthz — liveness probe (200 unless registered checks all fail)
+//	/readyz  — readiness probe (200 only when all readiness checks pass)
+//
+// Blocking — run in a goroutine. The metrics port is intentionally separate
+// from the main application port so auth/rate-limit middleware on the main
+// engine doesn't block scrapes or k8s probes.
 func Serve(addr string) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(Registry, promhttp.HandlerOpts{
 		Registry:          Registry,
 		EnableOpenMetrics: false,
 	}))
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	srv := &http.Server{Addr: addr, Handler: mux}
+	mux.HandleFunc("/healthz", livenessHandler)
+	mux.HandleFunc("/readyz", readinessHandler)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	return srv.ListenAndServe()
+}
+
+// resultLabel returns "ok" when err is nil, else "error". Used by all helpers
+// to keep edge-success/edge-error queries uniform across metrics.
+func resultLabel(err error) string {
+	if err != nil {
+		return "error"
+	}
+	return "ok"
 }
