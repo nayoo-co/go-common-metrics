@@ -32,6 +32,7 @@
 package metrics
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"time"
@@ -99,6 +100,13 @@ func initWith(name string, kind ServiceType) {
 		registerQueueMetrics()
 		registerHealthMetrics()
 		registerBuildInfoMetrics()
+
+		// Default "self" readiness check — guarantees every service has at
+		// least one nayoo_health_check series so the dashboard "Ready" tile
+		// never shows No Data. Services with real upstream deps add their
+		// own checks via RegisterReadinessCheck("docdb", ...) etc.; those
+		// will turn the tile red on outage.
+		RegisterReadinessCheck("self", func(_ context.Context) error { return nil })
 
 		// Background gauge refresher — keeps nayoo_health_check up-to-date even
 		// when /readyz isn't being polled (k8s probes go to the app's 8080, not
