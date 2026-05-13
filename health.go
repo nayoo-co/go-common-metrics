@@ -63,6 +63,31 @@ func RegisterReadinessCheck(name string, check HealthCheck) {
 	healthMu.Unlock()
 }
 
+// startHealthGaugeRefresher runs liveness + readiness checks on a 15s ticker
+// so the nayoo_health_check gauge reflects current state regardless of whether
+// /healthz or /readyz is being hit. k8s probes typically target the app's main
+// HTTP port (8080) and never call our :9090 endpoints, so without this ticker
+// the gauge would stay unset for the lifetime of the pod.
+//
+// Started once by initWith() in metrics.go. Each tick budgets 5s total across
+// all checks; an individual check should still complete in < 1s.
+func startHealthGaugeRefresher() {
+	go func() {
+		// First tick after a small delay so registered checks have a chance to
+		// finish their async setup (e.g. mongo.Connect in main).
+		time.Sleep(3 * time.Second)
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = runChecks(ctx, "liveness", livenessChecks)
+			_ = runChecks(ctx, "readiness", readinessChecks)
+			cancel()
+			<-ticker.C
+		}
+	}()
+}
+
 type checkReport struct {
 	Name   string `json:"name"`
 	Status string `json:"status"`

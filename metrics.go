@@ -99,6 +99,11 @@ func initWith(name string, kind ServiceType) {
 		registerQueueMetrics()
 		registerHealthMetrics()
 		registerBuildInfoMetrics()
+
+		// Background gauge refresher — keeps nayoo_health_check up-to-date even
+		// when /readyz isn't being polled (k8s probes go to the app's 8080, not
+		// the metrics server's 9090).
+		startHealthGaugeRefresher()
 	})
 }
 
