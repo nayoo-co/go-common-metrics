@@ -1,4 +1,4 @@
-module github.com/serpentdark/go-common-metrics
+module github.com/nayoo-co/go-common-metrics
 
 go 1.25.5
 
